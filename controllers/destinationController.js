@@ -24,6 +24,7 @@ const deriveCategory = (kinds = '', name = '', description = '') => {
   if (/(adventure|trek|hike|trail|mountain|peak|forest|national park|wildlife|safari|canyon|rafting|ski|cliff)/.test(text)) return 'adventure';
   return 'adventure';
 };
+
 const fallbackImage =
   'https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1200&q=60';
 
@@ -33,16 +34,33 @@ const buildRating = (rate) => {
   return Math.min(5, Math.max(3.5, Number(scaled.toFixed(1))));
 };
 
+const sanitizeDescription = (text = '') => {
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  if (/[^\x00-\x7F]/.test(cleaned)) return '';
+  return cleaned.length > 220 ? cleaned.slice(0, 217) + '...' : cleaned;
+};
+
+const normalizeOutput = (items = []) =>
+  items.map((item) => {
+    const description = sanitizeDescription(item.description) || 'A popular destination worth exploring.';
+    return { ...item, description };
+  });
+
 const mapToDestination = (details) => ({
   name: details?.name || 'Hidden gem',
   country: details?.address?.country || details?.address?.city || 'Unknown',
   image: details?.preview?.source || fallbackImage,
   description:
-    details?.wikipedia_extracts?.text ||
-    details?.info?.descr ||
+    sanitizeDescription(details?.wikipedia_extracts?.text) ||
+    sanitizeDescription(details?.info?.descr) ||
     'A popular destination worth exploring.',
   rating: buildRating(details?.rate),
-  category: deriveCategory(details?.kinds || '', details?.name || '', details?.wikipedia_extracts?.text || details?.info?.descr || ''),
+  category: deriveCategory(
+    details?.kinds || '',
+    details?.name || '',
+    details?.wikipedia_extracts?.text || details?.info?.descr || ''
+  ),
   lat: details?.point?.lat || 0,
   lng: details?.point?.lon || 0
 });
@@ -82,10 +100,7 @@ const resolveCenter = async (name) => {
 };
 
 const fetchRadiusPlaces = async ({ lat, lon }, limit = 20) =>
-  otmRequest(
-    'radius',
-    `radius=250000&limit=${limit}&offset=0&lon=${lon}&lat=${lat}&format=json`
-  );
+  otmRequest('radius', `radius=250000&limit=${limit}&offset=0&lon=${lon}&lat=${lat}&format=json`);
 
 const getDynamicDestinations = async ({ query, country, limit = 18 }) => {
   if (!OTM_KEY) return [];
@@ -120,11 +135,7 @@ const getDynamicDestinations = async ({ query, country, limit = 18 }) => {
 
   const top = Array.from(unique.values()).slice(0, limit);
 
-  const details = await Promise.all(
-    top.map((item) =>
-      otmRequest(`xid/${item.xid}`, '').catch(() => null)
-    )
-  );
+  const details = await Promise.all(top.map((item) => otmRequest(`xid/${item.xid}`, '').catch(() => null)));
 
   const detailed = details.filter(Boolean).map(mapToDestination);
   if (detailed.length) return detailed;
@@ -142,6 +153,33 @@ const applyQueryFilter = (items = [], query = '') => {
     return name.includes(term) || country.includes(term) || description.includes(term);
   });
 };
+
+const topUpFromDb = async ({ query, country, category, limit, excludeNames = [] }) => {
+  const regex = query ? new RegExp(query, 'i') : null;
+  const queryFilter = regex ? { $or: [{ name: regex }, { country: regex }, { description: regex }] } : {};
+  const countryFilter = country && country !== 'all' ? { country } : {};
+
+  const fallbackRaw = await Destination.find({ ...queryFilter, ...countryFilter })
+    .sort({ rating: -1, name: 1 })
+    .limit(Number(limit) || 18);
+
+  let fallback = fallbackRaw.map((item) => {
+    const obj = item.toObject();
+    return { ...obj, category: obj.category || deriveCategory('', obj.name, obj.description) };
+  });
+
+  if (category && category !== 'all') {
+    fallback = fallback.filter((item) => item.category === category);
+  }
+
+  if (excludeNames.length) {
+    const exclude = new Set(excludeNames.map((name) => String(name).toLowerCase()));
+    fallback = fallback.filter((item) => !exclude.has(String(item.name).toLowerCase()));
+  }
+
+  return fallback;
+};
+
 const getDestinations = async (req, res) => {
   await seedDestinationsIfEmpty();
   const destinations = await Destination.find().sort({ rating: -1, name: 1 });
@@ -149,7 +187,7 @@ const getDestinations = async (req, res) => {
     const obj = item.toObject();
     return { ...obj, category: obj.category || deriveCategory('', obj.name, obj.description) };
   });
-  res.json(withCategories);
+  res.json(normalizeOutput(withCategories));
 };
 
 const searchDestinations = async (req, res) => {
@@ -160,25 +198,8 @@ const searchDestinations = async (req, res) => {
   const categoryFilter = normalizeCategory(category);
 
   if (!OTM_KEY) {
-    const regex = query ? new RegExp(query, 'i') : null;
-    const queryFilter = regex
-      ? { $or: [{ name: regex }, { country: regex }, { description: regex }] }
-      : {};
-    const countryFilter = country && country !== 'all' ? { country } : {};
-    const fallbackRaw = await Destination.find({ ...queryFilter, ...countryFilter })
-      .sort({ rating: -1, name: 1 })
-      .limit(Number(limit) || 18);
-
-    let fallback = fallbackRaw.map((item) => {
-      const obj = item.toObject();
-      return { ...obj, category: obj.category || deriveCategory('', obj.name, obj.description) };
-    });
-
-    if (categoryFilter !== 'all') {
-      fallback = fallback.filter((item) => item.category === categoryFilter);
-    }
-
-    res.json(fallback);
+    const fallback = await topUpFromDb({ query, country, category: categoryFilter, limit: Number(limit) || 18 });
+    res.json(normalizeOutput(fallback));
     return;
   }
 
@@ -191,61 +212,32 @@ const searchDestinations = async (req, res) => {
 
     let filteredItems = applyQueryFilter(items, query);
     if (categoryFilter !== 'all') {
-      filteredItems = filteredItems.filter((item) =>
-        (item.category || deriveCategory('', item.name, item.description)) === categoryFilter
+      filteredItems = filteredItems.filter(
+        (item) => (item.category || deriveCategory('', item.name, item.description)) === categoryFilter
       );
     }
 
     if (filteredItems.length) {
-      res.json(filteredItems);
+      const topUp = await topUpFromDb({
+        query,
+        country,
+        category: categoryFilter,
+        limit: Number(limit) || 18,
+        excludeNames: filteredItems.map((item) => item.name)
+      });
+      const combined = [...filteredItems, ...topUp].slice(0, Number(limit) || 18);
+      res.json(normalizeOutput(combined));
       return;
     }
 
-    const regex = query ? new RegExp(query, 'i') : null;
-    const queryFilter = regex
-      ? { $or: [{ name: regex }, { country: regex }, { description: regex }] }
-      : {};
-    const countryFilter = country && country !== 'all' ? { country } : {};
-    const fallbackRaw = await Destination.find({ ...queryFilter, ...countryFilter })
-      .sort({ rating: -1, name: 1 })
-      .limit(Number(limit) || 18);
-
-    let fallback = fallbackRaw.map((item) => {
-      const obj = item.toObject();
-      return { ...obj, category: obj.category || deriveCategory('', obj.name, obj.description) };
-    });
-
-    if (categoryFilter !== 'all') {
-      fallback = fallback.filter((item) => item.category === categoryFilter);
-    }
-
-    res.json(fallback);
+    const fallback = await topUpFromDb({ query, country, category: categoryFilter, limit: Number(limit) || 18 });
+    res.json(normalizeOutput(fallback));
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('OpenTripMap search error', error?.message || error);
-    const regex = query ? new RegExp(query, 'i') : null;
-    const queryFilter = regex
-      ? { $or: [{ name: regex }, { country: regex }, { description: regex }] }
-      : {};
-    const countryFilter = country && country !== 'all' ? { country } : {};
-    const fallbackRaw = await Destination.find({ ...queryFilter, ...countryFilter })
-      .sort({ rating: -1, name: 1 })
-      .limit(Number(limit) || 18);
-    let fallback = fallbackRaw.map((item) => {
-      const obj = item.toObject();
-      return { ...obj, category: obj.category || deriveCategory('', obj.name, obj.description) };
-    });
-    if (categoryFilter !== 'all') {
-      fallback = fallback.filter((item) => item.category === categoryFilter);
-    }
-    res.json(fallback);
+    const fallback = await topUpFromDb({ query, country, category: categoryFilter, limit: Number(limit) || 18 });
+    res.json(normalizeOutput(fallback));
   }
 };
 
 module.exports = { getDestinations, searchDestinations };
-
-
-
-
-
-
